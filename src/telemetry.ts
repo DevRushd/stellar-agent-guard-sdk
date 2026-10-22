@@ -917,6 +917,48 @@ export interface FailedTxPollResult {
  */
 const MAX_TRACKED_FAILED_TX = 1_000;
 
+/**
+ * Default capacity limit on emitted event IDs retained in `mergeGuardEventStreams`
+ * to bound memory consumption for long-running telemetry streams (issue #278).
+ */
+export const DEFAULT_DEDUP_CAPACITY = 10_000;
+
+/**
+ * Bounded deduplicator for event IDs using a FIFO eviction strategy.
+ */
+export class BoundedEventDeduplicator {
+  readonly capacity: number;
+  private readonly set = new Set<string>();
+  private readonly queue: string[] = [];
+
+  constructor(capacity: number = DEFAULT_DEDUP_CAPACITY) {
+    if (!Number.isInteger(capacity) || capacity < 1) {
+      throw new RangeError(`Deduplicator capacity must be a positive integer, received ${capacity}`);
+    }
+    this.capacity = capacity;
+  }
+
+  has(id: string): boolean {
+    return this.set.has(id);
+  }
+
+  add(id: string): void {
+    if (this.set.has(id)) return;
+    if (this.queue.length >= this.capacity) {
+      const oldest = this.queue.shift();
+      if (oldest !== undefined) {
+        this.set.delete(oldest);
+      }
+    }
+    this.set.add(id);
+    this.queue.push(id);
+  }
+
+  get size(): number {
+    return this.set.size;
+  }
+}
+
 /** Cap on the coverage gaps `health()` retains, oldest evicted first. */
 const MAX_RECORDED_GAPS = 100;
 
@@ -1397,6 +1439,11 @@ export interface GuardTelemetryUnifiedParams extends GuardTelemetryWatchParams {
    * order. Absent → `watchAll()` degenerates cleanly to the committed stream.
    */
   diagnostics?: AsyncIterable<GuardDiagnosticBatch> | Iterable<GuardDiagnosticBatch>;
+  /**
+   * Optional capacity limit on retained event IDs for stream de-duplication (issue #278).
+   * Defaults to `DEFAULT_DEDUP_CAPACITY` (10,000 entries).
+   */
+  dedupCapacity?: number;
 }
 
 /** Render an unknown thrown value as a message, for the health snapshot. */
@@ -1507,10 +1554,11 @@ export async function* mergeGuardEventStreams(
   committedSource: AsyncIterable<GuardEvent[]> | Iterable<GuardEvent[]>,
   diagnosticSource?: AsyncIterable<GuardDiagnosticBatch> | Iterable<GuardDiagnosticBatch>,
   signal?: AbortSignal,
+  dedupCapacity: number = DEFAULT_DEDUP_CAPACITY,
 ): AsyncGenerator<GuardEvent, void, undefined> {
   const committed = asAsyncIterator(committedSource);
   const diagnostics = diagnosticSource ? asAsyncIterator(diagnosticSource) : null;
-  const emitted = new Set<string>();
+  const emitted = new BoundedEventDeduplicator(dedupCapacity);
 
   let onAbort: (() => void) | null = null;
   const abortArm = signal
@@ -2369,9 +2417,11 @@ export class GuardTelemetryListener {
       // diagnostic half of its merged stream for the same reason.
       for (const event of events) this.counters?.record(event);
 
-      await this.activeCursorStore.save(page.cursor);
-      
       if (events.length > 0) yield events;
+
+      // Safe telemetry checkpointing (issue #274): save cursor after consumer
+      // resumes past yield, preserving at-least-once delivery across crashes.
+      await this.activeCursorStore.save(page.cursor);
 
       // Advance confirmed coverage. A page that reached the RPC's head confirms
       // everything up to `latestLedger`; a full page (a partial window, more to
@@ -2422,6 +2472,7 @@ export class GuardTelemetryListener {
         this.watchStream(params),
         params.diagnostics,
         params.signal,
+        params.dedupCapacity,
       )) {
         // Committed and failed-tx events were already counted by the page loop
         // in `watchStream()`, so only the diagnostic half is counted here —
