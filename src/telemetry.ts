@@ -42,6 +42,7 @@ import {
 } from "./events.ts";
 import { bytesToHex, sha256Hex, utf8Length } from "./hash.ts";
 import { topicSymbols } from "./invoke.ts";
+import { withResolvedServer, type WithRpcTransport } from "./transport.ts";
 import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
 
 /** The event name topics this SDK knows how to interpret. */
@@ -685,6 +686,11 @@ export class GuardEventRingBuffer {
 }
 
 export interface GuardTelemetryConfig {
+  /**
+   * The RPC transport, used verbatim. Inject your own instance to route RPC
+   * through a proxy (auth headers, mTLS) or to mock it in tests. Mutually
+   * exclusive with `url`.
+   */
   server: rpc.Server;
   /** The guard contract to follow. */
   guard: string;
@@ -771,6 +777,13 @@ export interface GuardEventDropCounts {
   missingContractId: number;
   /** Events whose `contractId` was present but is not a contract address. */
   malformedContractId: number;
+  /**
+   * Events that failed decoding (e.g. malformed topic or data XDR) (issue #284).
+   *
+   * Isolated to the individual event so one broken event does not fail the
+   * whole page.
+   */
+  malformedEvent: number;
 }
 
 /**
@@ -812,6 +825,13 @@ export interface PollResult {
    * event payload. Additive (issue #287).
    */
   unknownTopics: GuardUnknownTopic[];
+  /**
+   * How many committed events on this page failed decoding (issue #284).
+   *
+   * Isolated to the individual event without failing the page or discarding
+   * its valid neighbors.
+   */
+  malformedEvents: number;
 }
 
 /**
@@ -1496,6 +1516,21 @@ export interface GuardTelemetryWatchParams {
    */
   onUnknownTopics?: (unknownTopics: readonly GuardUnknownTopic[]) => void;
   /**
+   * Called once for each successful page that contains at least one committed event
+   * that failed decoding (e.g. malformed XDR) (issue #284).
+   *
+   * The callback receives the count of malformed events on that page — never
+   * raw XDR or the source event payload. A throwing callback is isolated so an
+   * observability sink cannot stop the stream.
+   */
+  onMalformed?: (count: number) => void;
+  /**
+   * Diagnostic callback invoked per malformed event with safe metadata
+   * (ledger and transaction hash) — never the malformed payload itself (issue #284).
+   * A throwing callback is isolated so an observability sink cannot stop the stream.
+   */
+  onMalformedEvent?: (diagnostic: { ledger: number; transactionHash: string | null }) => void;
+  /**
    * Called once when the committed stream ends because of a terminal RPC
    * failure — after the bounded retry envelope is exhausted. Fail-visible
    * telemetry: a silent stream death is an incident blind spot.
@@ -2108,11 +2143,21 @@ function cursorNetworkIdentity(config: GuardTelemetryConfig): string {
 }
 
 /**
+ * What a transport-backed `GuardTelemetryListener` accepts: `GuardTelemetryConfig`
+ * with the shared `{ server? | url? }` transport (issue #117).
+ */
+export type GuardTelemetryInputConfig = WithRpcTransport<GuardTelemetryConfig>;
+
+/**
  * Config for a listener used purely for local state (counters, `recent()`),
  * with no RPC transport. A host that only wants `observe()`/`stats()` does not
  * need a `server` and should not have to fabricate one.
  */
 export interface GuardTelemetryLocalConfig {
+  /** A local listener has no transport. */
+  server?: never;
+  /** A local listener has no transport. */
+  url?: never;
   /** Opt-in sliding-window counters over allowed/blocked decisions. */
   counters?: GuardTelemetryCountersOptions;
   /** Clock the counters consult for `windowMs` eviction. */
@@ -2299,8 +2344,23 @@ export class GuardTelemetryListener {
    */
   private readonly counters: GuardDecisionCounters | null;
 
-  constructor(config: GuardTelemetryConfig | GuardTelemetryLocalConfig = {}) {
-    const resolved = config as GuardTelemetryConfig;
+  constructor(config: GuardTelemetryInputConfig | GuardTelemetryLocalConfig = {}) {
+    // Shared transport (issue #117): exactly one of `server` (used verbatim)
+    // or `url` (the SDK builds the `rpc.Server`). A purely local listener (no
+    // `guard`, see `GuardTelemetryLocalConfig`) has no transport at all.
+    const supplied = config as { server?: unknown; url?: unknown; guard?: unknown };
+    const isLocal =
+      supplied.guard === undefined && supplied.server === undefined && supplied.url === undefined;
+    const resolved = (
+      isLocal
+        ? config
+        : {
+            ...withResolvedServer<GuardTelemetryConfig>(config as GuardTelemetryInputConfig),
+            rpcUrl:
+              (config as { rpcUrl?: string }).rpcUrl ??
+              (typeof supplied.url === "string" ? supplied.url : undefined),
+          }
+    ) as GuardTelemetryConfig;
     this.config = resolved;
     this.guardContractId = canonicalContractId(resolved.guard) ?? resolved.guard ?? "";
     this.cursorNetwork = cursorNetworkIdentity(resolved);
@@ -2533,7 +2593,14 @@ export class GuardTelemetryListener {
    * unrecognised topic is dropped rather than guessed at.
    */
   async poll(
-    params: { startLedger?: number; cursor?: string; limit?: number } = {},
+    params: {
+      startLedger?: number;
+      cursor?: string;
+      limit?: number;
+      onMalformedEvent?:
+        | ((diagnostic: { ledger: number; transactionHash: string | null }) => void)
+        | undefined;
+    } = {},
   ): Promise<PollResult> {
     const request = (
       params.cursor
@@ -2568,6 +2635,7 @@ export class GuardTelemetryListener {
       foreignContract: 0,
       missingContractId: 0,
       malformedContractId: 0,
+      malformedEvent: 0,
     };
     const unknownTopicCounts = new Map<string, number>();
     for (const event of response.events) {
@@ -2587,21 +2655,49 @@ export class GuardTelemetryListener {
         dropped.foreignContract += 1;
         continue;
       }
-      const topics = event.topic.map((topic) => String(scValToNative(topic)));
-      const decoded = interpret(topics, decodeData(event.value), {
-        source: "ledger",
-        stream: "committed",
-        contractId,
-        ledger: event.ledger,
-        ledgerClosedAt: event.ledgerClosedAt ?? null,
-        transactionHash: event.txHash ?? null,
-        // Committed events anchor on the transaction hash, not on a position
-        // within a page: a page boundary would otherwise change an event's id.
-        simulationIndex: null,
-        // `includeRaw` is off unless the listener was constructed with it, so
-        // the default path keeps discarding the RPC object (issue #94).
-        ...(this.config.includeRaw ? { raw: event } : {}),
-      });
+
+      let topics: string[];
+      // Declared without an initializer: the try assigns it, and the catch
+      // `continue`s — control only reaches the checks below with a value.
+      let decoded: GuardEvent | null;
+      try {
+        topics = event.topic.map((topic) => String(scValToNative(topic)));
+        decoded = interpret(topics, decodeData(event.value), {
+          source: "ledger",
+          stream: "committed",
+          contractId,
+          ledger: event.ledger,
+          ledgerClosedAt: event.ledgerClosedAt ?? null,
+          transactionHash: event.txHash ?? null,
+          // Committed events anchor on the transaction hash, not on a position
+          // within a page: a page boundary would otherwise change an event's id.
+          simulationIndex: null,
+          // `includeRaw` is off unless the listener was constructed with it, so
+          // the default path keeps discarding the RPC object (issue #94).
+          ...(this.config.includeRaw ? { raw: event } : {}),
+        });
+      } catch {
+        // Isolate decoding failures to the individual committed event and
+        // continue decoding the rest of the page (issue #284).
+        // Log safely without logging raw payload contents by default.
+        dropped.malformedEvent += 1;
+        this.logger.debug("skipped malformed committed event", {
+          guard: this.config.guard,
+          ledger: event.ledger,
+        });
+        if (params.onMalformedEvent) {
+          try {
+            params.onMalformedEvent({
+              ledger: event.ledger,
+              transactionHash: event.txHash ?? null,
+            });
+          } catch {
+            // Observer isolation: an observer callback cannot fail the poll.
+          }
+        }
+        continue;
+      }
+
       if (decoded) {
         events.push(decoded);
       } else {
@@ -2617,7 +2713,8 @@ export class GuardTelemetryListener {
       dropped.unknownTopic +
       dropped.foreignContract +
       dropped.missingContractId +
-      dropped.malformedContractId;
+      dropped.malformedContractId +
+      dropped.malformedEvent;
     this.logger.debug("telemetry page received", {
       guard: this.config.guard,
       events: events.length,
@@ -2633,6 +2730,7 @@ export class GuardTelemetryListener {
       cursor: response.cursor,
       latestLedger: response.latestLedger,
       dropped,
+      malformedEvents: dropped.malformedEvent,
       // Best-effort: a host that omits the retention boundary gets no gap
       // detection, rather than a boundary invented from `latestLedger`.
       oldestLedger,
@@ -2763,19 +2861,19 @@ export class GuardTelemetryListener {
     this.consecutiveFailures = 0;
     this.lastErrorAt = null;
 
-    // An abort that landed before the iterator was first pulled must not probe
-    // the RPC — not even the `getLatestLedger` call that resolves the default
-    // start ledger. Teardown gets no requests at all, not one.
+    // Honor a pre-aborted signal before every startup request (issue #281).
     if (signal?.aborted) return;
 
     this.healthState = "running";
     this.healthStartedAt = this.nowIso();
 
     if (cursor === undefined && startLedger === undefined) {
+      if (signal?.aborted) return;
       cursor = (await this.activeCursorStore.load(this.cursorScope("events"))) ?? undefined;
     }
 
     if (this.config.failedTx) {
+      if (signal?.aborted) return;
       // The failed-transaction stream resumes from its own store, never from
       // `cursorStore` (issue #279): the cursors are not interchangeable. The
       // scope makes that separation durable even if a caller hands both
@@ -2794,10 +2892,55 @@ export class GuardTelemetryListener {
       expectedFrom = params.resumeLedger === undefined ? null : params.resumeLedger + 1;
     } else {
       if (startLedger === undefined) {
-        const latest = await this.config.server.getLatestLedger();
-        startLedger = Math.max(1, latest.sequence - 1);
+        if (signal?.aborted) return;
+        try {
+          const latest = await this.config.server.getLatestLedger();
+          startLedger = Math.max(1, latest.sequence - 1);
+        } catch (error) {
+          if (signal?.aborted) {
+            this.logger.debug("telemetry watch aborted with a request in flight", {
+              guard: this.config.guard,
+            });
+            return;
+          }
+          this.recordFailedPoll();
+          let terminal: unknown = error;
+          let attempts = 0;
+          let recovered = false;
+          while (attempts < retry.maxRetries) {
+            attempts += 1;
+            const backoff = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempts - 1));
+            await raceAbort(signal, () => sleep(backoff, signal));
+            if (signal?.aborted) return;
+            try {
+              const latest = await this.config.server.getLatestLedger();
+              startLedger = Math.max(1, latest.sequence - 1);
+              recovered = true;
+              break;
+            } catch (retryError) {
+              if (signal?.aborted) return;
+              terminal = retryError;
+              this.recordFailedPoll();
+            }
+          }
+          if (!recovered) {
+            this.logger.warn(
+              `telemetry startup latest ledger resolution failed: ${terminal instanceof Error ? terminal.message : String(terminal)}`,
+              { guard: this.config.guard },
+            );
+            this.lastError = terminal;
+            this.lastErrorAt = this.nowIso();
+            this.healthState = "failed";
+            if (params.onStreamError) params.onStreamError(terminal);
+            return;
+          }
+        }
       }
-      expectedFrom = startLedger;
+      // Every path that leaves `startLedger` undefined has already returned,
+      // but the compiler cannot see that through the try/catch — and `null`
+      // means the same thing here anyway: gap detection is skipped rather
+      // than guessed at.
+      expectedFrom = startLedger ?? null;
     }
 
     while (!signal?.aborted) {
@@ -2808,6 +2951,7 @@ export class GuardTelemetryListener {
           ...(startLedger !== undefined ? { startLedger } : {}),
           ...(cursor !== undefined ? { cursor } : {}),
           ...(params.limit !== undefined ? { limit: params.limit } : {}),
+          ...(params.onMalformedEvent ? { onMalformedEvent: params.onMalformedEvent } : {}),
         });
         this.recordHealthyPoll(page);
       } catch (error) {
@@ -2847,6 +2991,7 @@ export class GuardTelemetryListener {
               ...(startLedger !== undefined ? { startLedger } : {}),
               ...(cursor !== undefined ? { cursor } : {}),
               ...(params.limit !== undefined ? { limit: params.limit } : {}),
+              ...(params.onMalformedEvent ? { onMalformedEvent: params.onMalformedEvent } : {}),
             });
             break;
           } catch (retryError) {
@@ -2938,6 +3083,15 @@ export class GuardTelemetryListener {
       if (params.onUnknownTopics && page.unknownTopics.length > 0) {
         try {
           params.onUnknownTopics(page.unknownTopics);
+        } catch {
+          // Observability must not be able to stop telemetry: the same isolation
+          // contract as `onGap`.
+        }
+      }
+
+      if (params.onMalformed && page.dropped.malformedEvent > 0) {
+        try {
+          params.onMalformed(page.dropped.malformedEvent);
         } catch {
           // Observability must not be able to stop telemetry: the same isolation
           // contract as `onGap`.
