@@ -292,3 +292,59 @@ node scripts/check-enforcement-evidence.ts --check-structure
 As above, these are valuable but are not a substitute for the Phase-2 live
 suite. A maintainer with `.env.phase2` should run `npm run test:integration`
 against this branch before merge.
+
+## Addendum — 2026-10-22 (PR: policy validation and comparison, issues #306–#308)
+
+This PR touches `src/policy.ts`, so the enforcement-path evidence file is included
+as required. The policy validator now rejects values beyond the contract's
+`i128`/`u64` wire maxima; the address comparison key and duplicate-tolerant diff
+are client-side validation/display behavior and do not alter the contract's
+authorization decision.
+
+**The live suite did not reach its enforcement scenarios.** `npm run test:integration`
+used the documented default ephemeral deployment, deployed a SAC and guard, then
+failed during `initialize` with `txBadAuthExtra`. No fresh live enforcement
+result is claimed. The generated ephemeral environment file was removed after
+the failure. A maintainer should rerun the live suite successfully before merge.
+
+### What did run locally
+
+```text
+npm run typecheck
+npm run lint
+npm test
+node --import tsx --test tests/unit/policy.test.ts tests/unit/policy-schema.test.ts tests/unit/policy-diff.test.ts
+```
+
+The full unit suite passed; these offline checks do not substitute for the
+missing live-testnet scenarios above.
+
+## Addendum — 2026-10-25 (PR: agent-runtime guide, default policy, reason tests, simulation concurrency; issues #74, #59, #54, #40)
+
+This PR touches `src/policy.ts` (adds the frozen `DEFAULT_GUARD_POLICY` constant;
+no validation, encoding or decision logic changes) and `src/preflight.ts` (a
+concurrency limit and a bounded HTTP 429 retry around the existing
+`enforceCall` — the verdict classification itself is unchanged), so the
+enforcement-path evidence file is included as required.
+
+**The live suite was not run for this change.** The author has no funded
+`.env.phase2` testnet credentials, so `npm run test:integration` was not executed
+and no fresh live enforcement result is claimed. The one behavioural change
+reachable live is that at most four simulations per interceptor are in flight at
+once (default), which can only delay a verdict, never alter it. A maintainer with
+`.env.phase2` should run the live suite against this branch before merge.
+
+### What did run locally
+
+```text
+npm run typecheck
+npm run lint
+npm run format:check
+npm test
+npm run test:types
+npm run build && npm run test:exports && npm run test:pack
+node scripts/check-doc-links.ts
+```
+
+The offline checks above passed; they do not substitute for the live-testnet
+scenarios.
