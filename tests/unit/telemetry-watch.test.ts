@@ -246,7 +246,11 @@ describe("watch(signal) cursor persistence", () => {
     await gen.return();
 
     assert.deepEqual(seen, [[decodedEvent(501)], [decodedEvent(502)]]);
-    assert.equal(savedDuringFirstPageYield, false, "page 1's cursor is acknowledged only after consumer advances past yield");
+    assert.equal(
+      savedDuringFirstPageYield,
+      false,
+      "page 1's cursor is acknowledged only after consumer advances past yield",
+    );
     assert.deepEqual(rec.saves, ["cursor-2", "cursor-3"], "exactly one save per poll after yield");
   });
 
@@ -256,13 +260,17 @@ describe("watch(signal) cursor persistence", () => {
     const page3 = { events: [rawLedgerEvent(503)], cursor: "cursor-4" };
 
     const server1 = scriptedServer([page1, page2]).server;
-    const server2 = scriptedServer([page3]).server;
+    const { server: server2, requests: resumedRequests } = scriptedServer([page3]);
 
     const rec = recordingCursorStore(null);
 
     // First process: consumes two pages. To save cursor-3 (page2's cursor), consumer takes 2 pages
     // and then triggers the next iteration step.
-    const first = new GuardTelemetryListener({ server: server1, guard: GUARD, cursorStore: rec.store });
+    const first = new GuardTelemetryListener({
+      server: server1,
+      guard: GUARD,
+      cursorStore: rec.store,
+    });
     const gen = first.watch({ pollIntervalMs: 1 });
     await gen.next(); // receives page 1 (501)
     await gen.next(); // advances past page 1's yield (saves cursor-2), receives page 2 (502)
@@ -272,8 +280,13 @@ describe("watch(signal) cursor persistence", () => {
     assert.equal(rec.lastStored(), "cursor-3", "the restart point is the last saved cursor");
 
     // Second process: fresh listener, same store.
-    const second = new GuardTelemetryListener({ server: server2, guard: GUARD, cursorStore: rec.store });
+    const second = new GuardTelemetryListener({
+      server: server2,
+      guard: GUARD,
+      cursorStore: rec.store,
+    });
     const resumed = await take(second, 1);
+    const resumedRequest = resumedRequests[0];
 
     assert.deepEqual(
       resumed,
@@ -838,7 +851,7 @@ describe("durable cursor scoping (issue #282)", () => {
       cursorStore: rec.store,
     });
 
-    await take(listener, 1);
+    await take(listener, 2);
 
     const expected = {
       network: "soroban-testnet.stellar.org",
@@ -851,12 +864,16 @@ describe("durable cursor scoping (issue #282)", () => {
 
   it("two listeners with different guards sharing one store cannot load each other's cursor", async () => {
     const firstPage = { events: [rawLedgerEvent(501)], cursor: "cursor-a" };
-    const { server, requests } = scriptedServer([firstPage, { events: [], cursor: "cursor-b" }]);
+    const { server, requests } = scriptedServer([
+      firstPage,
+      { events: [rawLedgerEvent(502)], cursor: "cursor-trigger" },
+      { events: [], cursor: "cursor-b" },
+    ]);
     const shared = new InMemoryCursorStore();
 
     // Listener A persists its cursor into the shared store…
     const a = new GuardTelemetryListener({ server, guard: GUARD, cursorStore: shared });
-    await take(a, 1);
+    await take(a, 2, { maxBufferedPages: 0 });
     assert.equal(
       await shared.load({ network: "unknown-network", guard: GUARD, stream: "events" }),
       "cursor-a",
@@ -864,8 +881,8 @@ describe("durable cursor scoping (issue #282)", () => {
 
     // …and listener B, following a different guard, must not resume from it.
     const b = new GuardTelemetryListener({ server, guard: OTHER_GUARD, cursorStore: shared });
-    await take(b, 1);
-    const bFirstRequest = requests[1];
+    await take(b, 1, { maxBufferedPages: 0 });
+    const bFirstRequest = requests[2];
     assert.equal(bFirstRequest?.cursor, undefined, "B never sees A's cursor");
     assert.equal(bFirstRequest?.startLedger, 499, "B starts at the default head position instead");
   });
@@ -874,6 +891,7 @@ describe("durable cursor scoping (issue #282)", () => {
     const firstPage = { events: [rawLedgerEvent(501)], cursor: "cursor-mainnet" };
     const { server, requests } = scriptedServer([
       firstPage,
+      { events: [rawLedgerEvent(502)], cursor: "cursor-trigger" },
       { events: [], cursor: "cursor-testnet" },
     ]);
     const shared = new InMemoryCursorStore();
@@ -884,7 +902,7 @@ describe("durable cursor scoping (issue #282)", () => {
       rpcUrl: "https://rpc.mainnet.example.com",
       cursorStore: shared,
     });
-    await take(mainnet, 1);
+    await take(mainnet, 2, { maxBufferedPages: 0 });
 
     const testnet = new GuardTelemetryListener({
       server,
@@ -892,9 +910,9 @@ describe("durable cursor scoping (issue #282)", () => {
       rpcUrl: "https://soroban-testnet.stellar.org",
       cursorStore: shared,
     });
-    await take(testnet, 1);
+    await take(testnet, 1, { maxBufferedPages: 0 });
 
-    const testnetFirstRequest = requests[1];
+    const testnetFirstRequest = requests[2];
     assert.equal(
       testnetFirstRequest?.cursor,
       undefined,
@@ -917,10 +935,10 @@ describe("durable cursor scoping (issue #282)", () => {
       cursorStore: shared,
     };
 
-    await take(new GuardTelemetryListener(config), 1);
+    await take(new GuardTelemetryListener(config), 2);
     await take(new GuardTelemetryListener(config), 1);
 
-    assert.equal(requests[1]?.cursor, "cursor-2", "the scoped cursor still outlives the listener");
+    assert.equal(requests[2]?.cursor, "cursor-2", "the scoped cursor still outlives the listener");
     assert.equal(requests[1]?.startLedger, undefined);
   });
 
@@ -939,7 +957,7 @@ describe("durable cursor scoping (issue #282)", () => {
     };
 
     const listener = new GuardTelemetryListener({ server, guard: GUARD, cursorStore: legacyStore });
-    await take(listener, 1);
+    await take(listener, 2);
 
     assert.equal(requests[0]?.cursor, "cursor-8", "the legacy store still resumes the stream");
     assert.equal(stored, "cursor-9", "and still receives the advanced cursor");
@@ -1257,11 +1275,7 @@ describe("bounded look-ahead pump (issue #36)", () => {
       "one pull delivers exactly one page",
     );
     assert.equal(requests.length, 1, "one fetch per pull — nothing runs ahead");
-    assert.deepEqual(
-      rec.saves,
-      ["cursor-2"],
-      "the eager path still saves each poll's cursor before delivery",
-    );
+    assert.deepEqual(rec.saves, [], "no cursor is saved until the consumer resumes past the yield");
 
     await settle();
     assert.equal(requests.length, 1, "an idle consumer keeps the loop idle: no look-ahead");
@@ -1272,6 +1286,11 @@ describe("bounded look-ahead pump (issue #36)", () => {
       [502],
     );
     assert.equal(requests.length, 2, "the next pull performs the next fetch, and only it");
+    assert.deepEqual(
+      rec.saves,
+      ["cursor-2"],
+      "resuming past the first yield persists that page's cursor",
+    );
     await stream.return?.();
   });
 
@@ -1302,12 +1321,12 @@ describe("bounded look-ahead pump (issue #36)", () => {
     }
     assert.deepEqual(
       rec.saves,
-      ["cursor-2", "cursor-3"],
-      "only delivered pages advance the stored cursor; buffered pages stay unsaved",
+      ["cursor-2"],
+      "only a page the consumer has resumed past advances the stored cursor; buffered pages stay unsaved",
     );
     assert.equal(
       rec.lastStored(),
-      "cursor-3",
+      "cursor-2",
       "the stored cursor never leads the consumer's confirmed position",
     );
 
@@ -1325,7 +1344,7 @@ describe("bounded look-ahead pump (issue #36)", () => {
     await take(restarted, 1);
     assert.equal(
       requests[resumeRequestIndex]?.cursor,
-      "cursor-3",
+      "cursor-2",
       "the restart re-reads from the consumer's confirmed position",
     );
   });
@@ -1862,7 +1881,11 @@ describe("watch() safe checkpointing on interruption & crash (issue #274)", () =
     const { server: server2, requests: requests2 } = scriptedServer([page1Replay]);
     const rec = recordingCursorStore(null);
 
-    const firstListener = new GuardTelemetryListener({ server: server1, guard: GUARD, cursorStore: rec.store });
+    const firstListener = new GuardTelemetryListener({
+      server: server1,
+      guard: GUARD,
+      cursorStore: rec.store,
+    });
 
     // Simulate crash on consumer side when processing page 1 (before resuming/advancing past yield of page 1)
     try {
@@ -1870,7 +1893,11 @@ describe("watch() safe checkpointing on interruption & crash (issue #274)", () =
         if (events[0] && events[0].ledger === 501) {
           // Check saved cursor immediately inside the yield iteration block
           // The cursor for page 1 ("cursor-1") must NOT have been saved yet!
-          assert.equal(rec.lastStored(), null, "cursor must not be saved while consumer is processing yielded page");
+          assert.equal(
+            rec.lastStored(),
+            null,
+            "cursor must not be saved while consumer is processing yielded page",
+          );
           throw new Error("consumer crash mid-processing");
         }
       }
@@ -1881,12 +1908,24 @@ describe("watch() safe checkpointing on interruption & crash (issue #274)", () =
     assert.equal(rec.lastStored(), null, "cursor remains unadvanced after crash");
 
     // Second listener (simulating process restart)
-    const secondListener = new GuardTelemetryListener({ server: server2, guard: GUARD, cursorStore: rec.store });
+    const secondListener = new GuardTelemetryListener({
+      server: server2,
+      guard: GUARD,
+      cursorStore: rec.store,
+    });
     const resumedPages = await take(secondListener, 1);
 
     // Should re-fetch page 1 because cursor was not saved before crash
-    assert.deepEqual(resumedPages, [[decodedEvent(501)]], "re-delivers page 1 on restart (at-least-once guarantee)");
-    assert.equal(requests2[0]?.cursor, undefined, "first poll after restart resumes from unadvanced cursor");
+    assert.deepEqual(
+      resumedPages,
+      [[decodedEvent(501)]],
+      "re-delivers page 1 on restart (at-least-once guarantee)",
+    );
+    assert.equal(
+      requests2[0]?.cursor,
+      undefined,
+      "first poll after restart resumes from unadvanced cursor",
+    );
   });
 
   it("saves page cursor after consumer advances past yield", async () => {
@@ -1960,11 +1999,16 @@ describe("Bounded event-ID de-duplication (issue #278)", () => {
     }
 
     assert.equal(emitted.length, 2);
-    assert.deepEqual(emitted.map((e) => e.id), ["diag:hash1", "diag:hash2"]);
+    assert.deepEqual(
+      emitted.map((e) => e.id),
+      ["diag:hash1", "diag:hash2"],
+    );
   });
 
   it("bounds retained identity state over long streams past capacity", async () => {
-    const { BoundedEventDeduplicator, mergeGuardEventStreams } = await import("../../src/telemetry.ts");
+    const { BoundedEventDeduplicator, mergeGuardEventStreams } = await import(
+      "../../src/telemetry.ts"
+    );
 
     const dedup = new BoundedEventDeduplicator(5);
     for (let i = 1; i <= 10; i++) {

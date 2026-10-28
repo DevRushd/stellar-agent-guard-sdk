@@ -971,7 +971,9 @@ export class BoundedEventDeduplicator {
 
   constructor(capacity: number = DEFAULT_DEDUP_CAPACITY) {
     if (!Number.isInteger(capacity) || capacity < 1) {
-      throw new RangeError(`Deduplicator capacity must be a positive integer, received ${capacity}`);
+      throw new RangeError(
+        `Deduplicator capacity must be a positive integer, received ${capacity}`,
+      );
     }
     this.capacity = capacity;
   }
@@ -1283,12 +1285,19 @@ async function* boundedPagePump(
         outstanding -= 1;
         // Refill while the consumer works on this page.
         ensurePump();
-        // Persist before delivery, mirroring the loop's own save-before-yield
-        // (#37): a consumer that stops after this page resumes from it, while
-        // the pages still buffered stay unsaved and are re-read on restart.
-        await saveCursor(page.cursor);
-        if (page.failedTxCursor !== undefined) await saveFailedTxCursor(page.failedTxCursor);
-        if (page.events.length > 0) yield page.events;
+        // Safe telemetry checkpointing (issue #274): persist the page's
+        // cursors only after the consumer resumes past the yield below, so a
+        // consumer that stops after this page leaves the stored cursor
+        // unadvanced (at-least-once). An empty page is never delivered to the
+        // consumer, so it advances its cursor as soon as it is read.
+        if (page.events.length > 0) {
+          yield page.events;
+          await saveCursor(page.cursor);
+          if (page.failedTxCursor !== undefined) await saveFailedTxCursor(page.failedTxCursor);
+        } else {
+          await saveCursor(page.cursor);
+          if (page.failedTxCursor !== undefined) await saveFailedTxCursor(page.failedTxCursor);
+        }
         continue;
       }
       if (failure !== null) {
@@ -3126,23 +3135,6 @@ export class GuardTelemetryListener {
       // diagnostic half of its merged stream for the same reason.
       for (const event of events) this.counters?.record(event);
 
-      // Persist this poll's cursors before the page reaches the consumer
-      // (#37): a consumer that stops after this page resumes from it
-      // (at-least-once, never lose-the-tail). Deferred mode (issue #36's
-      // bounded page pump) hands that responsibility to the pump, which
-      // saves at delivery — the one place a page's events become the real
-      // consumer's — so the stored cursor never leads the consumer's
-      // position by a buffered page.
-      if (!options.deferCursorSave) {
-        await this.activeCursorStore.save(page.cursor, this.cursorScope("events"));
-        if (scannedFailedTxCursor !== undefined) {
-          await this.activeFailedTxCursorStore.save(
-            scannedFailedTxCursor,
-            this.cursorScope("failed_tx"),
-          );
-        }
-      }
-
       // In deferred mode every page is yielded — an empty one included — so
       // the pump still advances the cursors of polls that produced no batch.
       if (events.length > 0 || options.deferCursorSave) {
@@ -3153,9 +3145,21 @@ export class GuardTelemetryListener {
         };
       }
 
-      // Safe telemetry checkpointing (issue #274): save cursor after consumer
-      // resumes past yield, preserving at-least-once delivery across crashes.
-      await this.activeCursorStore.save(page.cursor);
+      // Safe telemetry checkpointing (issue #274): persist the page's cursors
+      // only after the consumer resumes past the yield above, so a consumer
+      // that stops, throws, or is terminated before resuming leaves the stored
+      // cursor unadvanced (at-least-once, never lose the tail). In deferred
+      // mode the bounded pump owns delivery and checkpoints at its own yield
+      // site, so this eager path stays out of its way.
+      if (!options.deferCursorSave) {
+        await this.activeCursorStore.save(page.cursor, this.cursorScope("events"));
+        if (scannedFailedTxCursor !== undefined) {
+          await this.activeFailedTxCursorStore.save(
+            scannedFailedTxCursor,
+            this.cursorScope("failed_tx"),
+          );
+        }
+      }
 
       // Advance confirmed coverage. A page that reached the RPC's head confirms
       // everything up to `latestLedger`; a full page (a partial window, more to
